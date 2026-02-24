@@ -15,13 +15,17 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { ordersApi, ShippingAddress } from '../src/api/orders';
+import { paymentsApi } from '../src/api/payments';
 import { useCartStore } from '../src/store/cartStore';
 import { COLORS, SIZES, SHADOWS } from '../src/constants/theme';
+
+const RAZORPAY_KEY_ID = process.env.EXPO_PUBLIC_RAZORPAY_KEY_ID || '';
 
 export default function CheckoutScreen() {
   const router = useRouter();
   const { items, total, clearCart } = useCartStore();
   const [loading, setLoading] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState<'cod' | 'razorpay'>('razorpay');
   const [address, setAddress] = useState<ShippingAddress>({
     full_name: '',
     phone: '',
@@ -35,41 +39,169 @@ export default function CheckoutScreen() {
   const shippingFee = total > 5000 ? 0 : 99;
   const grandTotal = total + shippingFee;
 
-  const handlePlaceOrder = async () => {
-    // Validate address
+  const validateAddress = () => {
     if (!address.full_name || !address.phone || !address.address_line1 || 
         !address.city || !address.state || !address.pincode) {
       Alert.alert('Error', 'Please fill in all required fields');
-      return;
+      return false;
     }
 
     if (address.phone.length < 10) {
       Alert.alert('Error', 'Please enter a valid phone number');
-      return;
+      return false;
     }
 
     if (address.pincode.length !== 6) {
       Alert.alert('Error', 'Please enter a valid 6-digit pincode');
-      return;
+      return false;
     }
+
+    return true;
+  };
+
+  const handleRazorpayPayment = async (orderId: string) => {
+    try {
+      // Create Razorpay order
+      const razorpayOrder = await paymentsApi.createRazorpayOrder(grandTotal);
+      
+      // Check if we're on web or native
+      if (Platform.OS === 'web') {
+        // For web, use Razorpay checkout.js
+        const options = {
+          key: razorpayOrder.key_id,
+          amount: razorpayOrder.amount,
+          currency: razorpayOrder.currency,
+          name: 'Constructo',
+          description: 'Construction Materials Purchase',
+          order_id: razorpayOrder.razorpay_order_id,
+          handler: async function (response: any) {
+            try {
+              // Verify payment
+              await paymentsApi.verifyPayment({
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature,
+                order_id: orderId,
+              });
+              
+              clearCart();
+              Alert.alert(
+                'Payment Successful!',
+                `Your order #${orderId.slice(0, 8)} has been placed successfully.`,
+                [
+                  {
+                    text: 'View Order',
+                    onPress: () => router.replace(`/order/${orderId}`),
+                  },
+                ]
+              );
+            } catch (error) {
+              console.log('Payment verification failed:', error);
+              Alert.alert('Payment Verification Failed', 'Please contact support.');
+            }
+          },
+          prefill: {
+            name: address.full_name,
+            contact: address.phone,
+          },
+          theme: {
+            color: COLORS.primary,
+          },
+        };
+        
+        // Load Razorpay script and open checkout
+        if (typeof window !== 'undefined') {
+          const script = document.createElement('script');
+          script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+          script.onload = () => {
+            const rzp = new (window as any).Razorpay(options);
+            rzp.open();
+          };
+          document.body.appendChild(script);
+        }
+      } else {
+        // For native, use react-native-razorpay
+        try {
+          const RazorpayCheckout = require('react-native-razorpay').default;
+          
+          const options = {
+            description: 'Construction Materials Purchase',
+            image: 'https://constructor-app.preview.emergentagent.com/icon.png',
+            currency: razorpayOrder.currency,
+            key: razorpayOrder.key_id,
+            amount: razorpayOrder.amount,
+            name: 'Constructo',
+            order_id: razorpayOrder.razorpay_order_id,
+            prefill: {
+              contact: address.phone,
+              name: address.full_name,
+            },
+            theme: { color: COLORS.primary },
+          };
+          
+          const response = await RazorpayCheckout.open(options);
+          
+          // Verify payment
+          await paymentsApi.verifyPayment({
+            razorpay_order_id: response.razorpay_order_id,
+            razorpay_payment_id: response.razorpay_payment_id,
+            razorpay_signature: response.razorpay_signature,
+            order_id: orderId,
+          });
+          
+          clearCart();
+          Alert.alert(
+            'Payment Successful!',
+            `Your order #${orderId.slice(0, 8)} has been placed successfully.`,
+            [
+              {
+                text: 'View Order',
+                onPress: () => router.replace(`/order/${orderId}`),
+              },
+            ]
+          );
+        } catch (error: any) {
+          console.log('Razorpay error:', error);
+          if (error.code !== 'PAYMENT_CANCELLED') {
+            Alert.alert('Payment Failed', error.description || 'Something went wrong');
+          }
+        }
+      }
+    } catch (error) {
+      console.log('Error creating Razorpay order:', error);
+      Alert.alert('Error', 'Failed to initiate payment. Please try again.');
+    }
+  };
+
+  const handlePlaceOrder = async () => {
+    if (!validateAddress()) return;
 
     try {
       setLoading(true);
+      
+      // Create order first
       const order = await ordersApi.createOrder({
         shipping_address: address,
-        payment_method: 'cod',
+        payment_method: paymentMethod,
       });
-      clearCart();
-      Alert.alert(
-        'Order Placed!',
-        `Your order #${order.id.slice(0, 8)} has been placed successfully.`,
-        [
-          {
-            text: 'View Order',
-            onPress: () => router.replace(`/order/${order.id}`),
-          },
-        ]
-      );
+      
+      if (paymentMethod === 'razorpay') {
+        // Handle Razorpay payment
+        await handleRazorpayPayment(order.id);
+      } else {
+        // COD - order already created
+        clearCart();
+        Alert.alert(
+          'Order Placed!',
+          `Your order #${order.id.slice(0, 8)} has been placed successfully.`,
+          [
+            {
+              text: 'View Order',
+              onPress: () => router.replace(`/order/${order.id}`),
+            },
+          ]
+        );
+      }
     } catch (error: any) {
       console.log('Error placing order:', error);
       Alert.alert('Error', error.response?.data?.detail || 'Failed to place order');
@@ -181,16 +313,40 @@ export default function CheckoutScreen() {
               <Ionicons name="wallet" size={18} color={COLORS.primary} /> Payment Method
             </Text>
             <View style={styles.paymentCard}>
-              <View style={styles.paymentOption}>
-                <View style={styles.radioSelected}>
-                  <View style={styles.radioInner} />
+              {/* Razorpay Option */}
+              <TouchableOpacity 
+                style={styles.paymentOption}
+                onPress={() => setPaymentMethod('razorpay')}
+              >
+                <View style={paymentMethod === 'razorpay' ? styles.radioSelected : styles.radio}>
+                  {paymentMethod === 'razorpay' && <View style={styles.radioInner} />}
                 </View>
-                <Ionicons name="cash-outline" size={24} color={COLORS.primary} />
+                <Ionicons name="card-outline" size={24} color={COLORS.primary} />
+                <View style={styles.paymentInfo}>
+                  <Text style={styles.paymentTitle}>Pay Online</Text>
+                  <Text style={styles.paymentSubtitle}>UPI, Cards, Net Banking, Wallets</Text>
+                </View>
+                <View style={styles.razorpayBadge}>
+                  <Text style={styles.razorpayText}>Razorpay</Text>
+                </View>
+              </TouchableOpacity>
+
+              <View style={styles.paymentDivider} />
+
+              {/* COD Option */}
+              <TouchableOpacity 
+                style={styles.paymentOption}
+                onPress={() => setPaymentMethod('cod')}
+              >
+                <View style={paymentMethod === 'cod' ? styles.radioSelected : styles.radio}>
+                  {paymentMethod === 'cod' && <View style={styles.radioInner} />}
+                </View>
+                <Ionicons name="cash-outline" size={24} color={COLORS.success} />
                 <View style={styles.paymentInfo}>
                   <Text style={styles.paymentTitle}>Cash on Delivery</Text>
                   <Text style={styles.paymentSubtitle}>Pay when you receive</Text>
                 </View>
-              </View>
+              </TouchableOpacity>
             </View>
           </View>
 
@@ -246,7 +402,9 @@ export default function CheckoutScreen() {
             {loading ? (
               <ActivityIndicator color={COLORS.white} />
             ) : (
-              <Text style={styles.placeOrderText}>Place Order</Text>
+              <Text style={styles.placeOrderText}>
+                {paymentMethod === 'razorpay' ? 'Pay Now' : 'Place Order'}
+              </Text>
             )}
           </TouchableOpacity>
         </View>
@@ -345,6 +503,22 @@ const styles = StyleSheet.create({
   paymentOption: {
     flexDirection: 'row',
     alignItems: 'center',
+    paddingVertical: 8,
+  },
+  paymentDivider: {
+    height: 1,
+    backgroundColor: COLORS.lightGray,
+    marginVertical: 12,
+  },
+  radio: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: COLORS.lightGray,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
   },
   radioSelected: {
     width: 20,
@@ -363,6 +537,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
   },
   paymentInfo: {
+    flex: 1,
     marginLeft: 12,
   },
   paymentTitle: {
@@ -373,6 +548,17 @@ const styles = StyleSheet.create({
   paymentSubtitle: {
     fontSize: SIZES.sm,
     color: COLORS.gray,
+  },
+  razorpayBadge: {
+    backgroundColor: '#072654',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  razorpayText: {
+    color: COLORS.white,
+    fontSize: 10,
+    fontWeight: '700',
   },
   summaryCard: {
     backgroundColor: COLORS.white,
