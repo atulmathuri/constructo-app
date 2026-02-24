@@ -431,6 +431,109 @@ async def get_order(order_id: str, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=404, detail="Order not found")
     return Order(**order)
 
+# ==================== RAZORPAY PAYMENT ENDPOINTS ====================
+
+class CreateRazorpayOrderRequest(BaseModel):
+    amount: float  # Amount in INR (will be converted to paise)
+
+class RazorpayOrderResponse(BaseModel):
+    razorpay_order_id: str
+    amount: int  # Amount in paise
+    currency: str
+    key_id: str
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+    order_id: str  # Our internal order ID
+
+@api_router.post("/payments/create-order", response_model=RazorpayOrderResponse)
+async def create_razorpay_order(request: CreateRazorpayOrderRequest, user: dict = Depends(require_auth)):
+    """Create a Razorpay order for payment"""
+    try:
+        # Convert to paise (Razorpay uses paise)
+        amount_in_paise = int(request.amount * 100)
+        
+        # Create Razorpay order
+        razorpay_order = razorpay_client.order.create({
+            "amount": amount_in_paise,
+            "currency": "INR",
+            "payment_capture": 1  # Auto capture payment
+        })
+        
+        # Store payment record
+        await db.payments.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "razorpay_order_id": razorpay_order["id"],
+            "amount": amount_in_paise,
+            "currency": "INR",
+            "status": "created",
+            "created_at": datetime.utcnow()
+        })
+        
+        return RazorpayOrderResponse(
+            razorpay_order_id=razorpay_order["id"],
+            amount=amount_in_paise,
+            currency="INR",
+            key_id=os.environ.get('RAZORPAY_KEY_ID', '')
+        )
+    except Exception as e:
+        logger.error(f"Razorpay order creation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Payment order creation failed: {str(e)}")
+
+@api_router.post("/payments/verify")
+async def verify_payment(request: VerifyPaymentRequest, user: dict = Depends(require_auth)):
+    """Verify Razorpay payment signature and update order status"""
+    try:
+        # Verify signature
+        key_secret = os.environ.get('RAZORPAY_KEY_SECRET', '')
+        message = f"{request.razorpay_order_id}|{request.razorpay_payment_id}"
+        
+        generated_signature = hmac.new(
+            key_secret.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        if generated_signature != request.razorpay_signature:
+            raise HTTPException(status_code=400, detail="Invalid payment signature")
+        
+        # Update payment record
+        await db.payments.update_one(
+            {"razorpay_order_id": request.razorpay_order_id},
+            {"$set": {
+                "razorpay_payment_id": request.razorpay_payment_id,
+                "razorpay_signature": request.razorpay_signature,
+                "status": "paid",
+                "paid_at": datetime.utcnow()
+            }}
+        )
+        
+        # Update order status to confirmed
+        await db.orders.update_one(
+            {"id": request.order_id, "user_id": user["id"]},
+            {"$set": {
+                "status": "confirmed",
+                "payment_method": "razorpay",
+                "razorpay_payment_id": request.razorpay_payment_id,
+                "updated_at": datetime.utcnow()
+            }}
+        )
+        
+        return {"message": "Payment verified successfully", "status": "paid"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Payment verification failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Payment verification failed: {str(e)}")
+
+@api_router.get("/payments/key")
+async def get_razorpay_key():
+    """Get Razorpay key ID for frontend"""
+    return {"key_id": os.environ.get('RAZORPAY_KEY_ID', '')}
+
 # ==================== REVIEW ENDPOINTS ====================
 
 @api_router.get("/products/{product_id}/reviews", response_model=List[Review])
