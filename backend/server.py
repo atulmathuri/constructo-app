@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime, timedelta
 import hashlib
 import secrets
+import razorpay
+import hmac
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -20,6 +22,11 @@ load_dotenv(ROOT_DIR / '.env')
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ.get('DB_NAME', 'constructo_db')]
+
+# Razorpay client
+razorpay_client = razorpay.Client(
+    auth=(os.environ.get('RAZORPAY_KEY_ID', ''), os.environ.get('RAZORPAY_KEY_SECRET', ''))
+)
 
 # Create the main app
 app = FastAPI(title="Constructo API", description="E-commerce API for construction materials")
